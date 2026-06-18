@@ -10,16 +10,21 @@ import {
   Animated,
   Dimensions,
   Alert,
+  ActivityIndicator,
 } from "react-native";
 import MapView, { Marker, Callout } from "react-native-maps";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Location from "expo-location";
 
+import { useMarkers } from "./src/hooks/useMarkers";
+import { formatTime } from "./src/utils/format";
+
 const { width, height } = Dimensions.get("window");
 
 export default function App() {
   const [location, setLocation] = useState(null);
-  const [markers, setMarkers] = useState([]);
+  // Estado e operações dos marcadores (Cloudinary + Firestore) ficam no hook.
+  const { markers, loading, saving, error, saveMarker, removeMarker } = useMarkers();
   const [selectedMarker, setSelectedMarker] = useState(null);
   const [cameraVisible, setCameraVisible] = useState(false);
   const [capturedPhoto, setCapturedPhoto] = useState(null);
@@ -125,46 +130,58 @@ const takePicture = async () => {
       accuracy: Location.Accuracy.Balanced,
     });
 
-    const newMarker = {
-      id: Date.now().toString(),
-      coordinate: {
-        latitude: currentLocation.coords.latitude,
-        longitude: currentLocation.coords.longitude,
-      },
-      photoUri: photo.uri,
-      timestamp: new Date().toLocaleTimeString("pt-BR", {
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
+    const coordinate = {
+      latitude: currentLocation.coords.latitude,
+      longitude: currentLocation.coords.longitude,
     };
 
-    setMarkers((prev) => [...prev, newMarker]);
+    // Fecha a câmera; o overlay de "saving" indica o upload em andamento.
+    setCameraVisible(false);
 
-    // Aguarda o flash terminar antes de fechar a câmera
-    setTimeout(() => {
-      setCameraVisible(false);
+    // Centraliza o mapa na posição da captura.
+    mapRef.current?.animateToRegion(
+      { ...coordinate, latitudeDelta: 0.005, longitudeDelta: 0.005 },
+      800
+    );
 
-      // Volta para a posição atual no mapa com animação
-      mapRef.current?.animateToRegion(
-        {
-          latitude: currentLocation.coords.latitude,
-          longitude: currentLocation.coords.longitude,
-          latitudeDelta: 0.005,
-          longitudeDelta: 0.005,
-        },
-        800
-      );
+    // Upload no Cloudinary + gravação no Firestore (RF01/RF02).
+    const newMarker = await saveMarker(photo.uri, coordinate);
 
-      // Mostra o preview do marker após o mapa animar
-      setTimeout(() => {
-        setSelectedMarker(newMarker);
-        showPreviewAnimation();
-      }, 900);
-    }, 380);
-
-  } catch (error) {
-    Alert.alert("Erro", "Não foi possível capturar a foto.");
+    // Exibe o preview do marker recém-criado.
+    setSelectedMarker(newMarker);
+    showPreviewAnimation();
+  } catch (err) {
+    Alert.alert(
+      "Erro",
+      err?.message || "Não foi possível capturar e salvar a foto."
+    );
   }
+};
+
+// Toque longo no marker: confirma e executa a exclusão (RF05/RF06).
+const handleMarkerLongPress = (marker) => {
+  Alert.alert(
+    "Excluir marcador",
+    "Deseja realmente excluir este marcador?",
+    [
+      { text: "Cancelar", style: "cancel" },
+      {
+        text: "Excluir",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            await removeMarker(marker.id);
+            // Fecha o preview caso o marker excluído esteja aberto.
+            if (selectedMarker?.id === marker.id) {
+              closePreview();
+            }
+          } catch (err) {
+            Alert.alert("Erro", err?.message || "Não foi possível excluir.");
+          }
+        },
+      },
+    ]
+  );
 };
   const showPreviewAnimation = () => {
     previewOpacity.setValue(0);
@@ -237,11 +254,12 @@ const takePicture = async () => {
               key={marker.id}
               coordinate={marker.coordinate}
               onPress={() => handleMarkerPress(marker)}
+              onLongPress={() => handleMarkerLongPress(marker)}
             >
               <View style={styles.markerContainer}>
                 <View style={styles.markerBubble}>
                   <Image
-                    source={{ uri: marker.photoUri }}
+                    source={{ uri: marker.imageUrl }}
                     style={styles.markerThumbnail}
                   />
                 </View>
@@ -276,13 +294,15 @@ const takePicture = async () => {
           </TouchableOpacity>
 
           <Image
-            source={{ uri: selectedMarker.photoUri }}
+            source={{ uri: selectedMarker.imageUrl }}
             style={styles.previewImage}
             resizeMode="cover"
           />
 
           <View style={styles.previewFooter}>
-            <Text style={styles.previewTime}>🕐 {selectedMarker.timestamp}</Text>
+            <Text style={styles.previewTime}>
+              🕐 {formatTime(selectedMarker.createdAt)}
+            </Text>
           </View>
 
           {/* Little arrow pointing down */}
@@ -290,13 +310,36 @@ const takePicture = async () => {
         </Animated.View>
       )}
 
+      {/* UPLOAD OVERLAY (enquanto envia ao Cloudinary / salva no Firestore) */}
+      {saving && (
+        <View style={styles.savingOverlay} pointerEvents="auto">
+          <View style={styles.savingCard}>
+            <ActivityIndicator size="large" color="#4ade80" />
+            <Text style={styles.savingText}>Enviando foto…</Text>
+          </View>
+        </View>
+      )}
+
       {/* HEADER */}
       <View style={styles.header}>
         <Text style={styles.headerTitle}>📸 FotoMapa</Text>
         <View style={styles.headerBadge}>
-          <Text style={styles.headerBadgeText}>{markers.length} foto{markers.length !== 1 ? "s" : ""}</Text>
+          {loading ? (
+            <ActivityIndicator size="small" color="#052e16" />
+          ) : (
+            <Text style={styles.headerBadgeText}>
+              {markers.length} foto{markers.length !== 1 ? "s" : ""}
+            </Text>
+          )}
         </View>
       </View>
+
+      {/* ERROR BANNER (ex.: falha ao carregar marcadores no início) */}
+      {error && !saving && (
+        <View style={styles.errorBanner}>
+          <Text style={styles.errorBannerText}>⚠️ {error}</Text>
+        </View>
+      )}
 
       {/* CAMERA BUTTON */}
       <Animated.View
@@ -326,11 +369,11 @@ const takePicture = async () => {
         <View style={styles.cameraContainer}>
           <CameraView
             ref={cameraRef}
-            style={styles.camera}
+            style={StyleSheet.absoluteFill}
             facing="back"
-          >
-            {/* Camera overlay UI */}
-            <View style={styles.cameraOverlay}>
+          />
+          {/* Overlay como irmão da câmera (CameraView não aceita filhos). */}
+          <View style={styles.cameraOverlay}>
               {/* Top bar */}
               <View style={styles.cameraTopBar}>
                 <TouchableOpacity
@@ -373,8 +416,7 @@ const takePicture = async () => {
                   { backgroundColor: "#fff", opacity: flashOpacity },
                 ]}
               />
-            </View>
-          </CameraView>
+          </View>
         </View>
       </Modal>
     </View>
@@ -550,6 +592,49 @@ const styles = StyleSheet.create({
     borderTopColor: "#0f0f14",
   },
 
+  // ── UPLOAD OVERLAY ───────────────────────────────────────────────────
+  savingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 50,
+  },
+  savingCard: {
+    backgroundColor: "rgba(15,15,20,0.95)",
+    paddingHorizontal: 28,
+    paddingVertical: 24,
+    borderRadius: 18,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.08)",
+  },
+  savingText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+    marginTop: 12,
+    letterSpacing: 0.3,
+  },
+
+  // ── ERROR BANNER ─────────────────────────────────────────────────────
+  errorBanner: {
+    position: "absolute",
+    bottom: 140,
+    left: 20,
+    right: 20,
+    backgroundColor: "rgba(220,38,38,0.92)",
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  errorBannerText: {
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: "600",
+    textAlign: "center",
+  },
+
   // ── CAMERA BUTTON ────────────────────────────────────────────────────
   cameraButtonWrapper: {
     position: "absolute",
@@ -601,7 +686,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   cameraOverlay: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
     justifyContent: "space-between",
   },
   cameraTopBar: {
